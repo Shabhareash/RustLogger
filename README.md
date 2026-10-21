@@ -1,31 +1,32 @@
 # RustLogger
 
-![RustLogger benchmark](Rustlogger.png)
+A high-performance log ingestion engine written in Rust. Built as a specialized alternative to Logstash/Vector edge agents in high-throughput SIEM pipelines.
 
-
-![Vector benchmark](Vector.png)
-
-
-
-A high-performance, zero-copy log ingestion engine written in Rust. Designed as a drop-in replacement for Logstash/Vector edge agents in high-throughput SIEM pipelines.
-
-Built from scratch by a single developer. Benchmarked at **1.04 million events/sec** (pure parsing) and **548,516 events/sec** sustained end-to-end with real disk I/O — on a laptop i5-10300H.
+Built from scratch by a single developer. The fair end-to-end benchmark in this repository is **~355,000 events/sec** on a 1M-event Kafka workload with JSON output, about **6.25x** Vector with a corrected Vector config.
 
 ## Performance
 
-### Head-to-Head: RustLogger vs Vector (Same Hardware, Same Data)
+### Fair Head-to-Head: RustLogger vs Vector
 
-| Metric | RustLogger | Vector | Advantage |
+Both engines consumed the same preloaded 1M-event, 3-partition Kafka topic, parsed the same ISO syslog input, and wrote JSON. Vector's config was corrected to use a cheap classifier check and at most one message regex per event, instead of executing all 16 `parse_regex` calls on every event.
+
+| Metric | RustLogger | Vector | Ratio |
 | :--- | ---: | ---: | ---: |
-| **Sustained EPS (3 partitions)** | **1,349,344** | ~90,000 | **14.9x** |
-| **CPU Efficiency** | **614,567 EPS/core** | ~45,000 EPS/core | **13.6x** |
-| **Memory (per consumer)** | **~333 MB** | ~400 MB | **1.2x** |
+| **Sustained EPS (median, 3 runs)** | **354,586** | **56,746** | **6.25x** |
+| **CPU Efficiency** | **164,389 EPS/core** | **18,382 EPS/core** | **8.9x** |
+| **Total RSS (median)** | **727 MB** | **359 MB** | **Vector uses 2.0x less** |
+| **Peak RSS** | **~996 MB** | **~449 MB** | **Vector uses 2.2x less** |
+| **Specialized parse rate** | **74.2%** | **82.3%** | **Vector classifies more** |
 
-> **Hardware:** Intel i5-10300H (4C/8T), 16GB DDR4, NVMe SSD (Benchmarked locally)  
-> **Workload:** 1M auth/syslog lines, 3 Kafka partitions, continuous producer  
-> **Vector config:** Kafka source → remap (VRL) → file sink ([official benchmark reference](https://vector.dev/docs/about/under-the-hood/architecture/end-to-end-acknowledgements/))
-> 
-> *Note on Benchmark Variance:* Because this was benchmarked on a laptop CPU (i5-10300H), sustained 30-second runs exhibit heavy thermal throttling. The engine reliably hits **1.0M - 1.3M EPS** during initial turbo-boost (4.5GHz) but may downclock to ~600k EPS under sustained thermal load (2.0GHz base clock) or due to Linux OS scheduler jitter multiplexing the Kafka Broker and 3 consumers onto just 4 physical cores. On dedicated server hardware without thermal constraints, the peak EPS acts as the steady-state.
+> **Hardware:** Intel Core Ultra 5 235U (12C/14T), 15 GB RAM, Linux 7.2.9.
+> **Workload:** 1,000,000 ISO syslog auth lines derived from `OpenSSH_200k.log`, preloaded into a 3-partition Kafka topic.
+> **Topology:** RustLogger runs 3 consumers (one per partition, 4 Rayon threads each). Vector runs 1 daemon with 12 threads.
+> **Sinks:** RustLogger writes NDJSON with ES bulk action lines to stdout; Vector writes JSON through a file sink and a blackhole counter. Both write to tmpfs (`/tmp`), so this measures parsing, serialization, and memory-backed output, not physical disk I/O.
+> **Reproduce:** `python3 bench/fair_bench.py --runs 3`. Raw table and methodology: `bench/RESULTS.md`.
+
+The earlier table (1,349,344 vs ~90,000, 14.9x) is not a fair comparison. It used a Vector config that ran all 16 `parse_regex` calls on every event because the `if` blocks did not short-circuit, and it compared Vector's blackhole sink against RustLogger writing to `/dev/null`. The corrected rerun above is the number to use. The 1.35M figure is a parse/serialize-to-`/dev/null` measurement, not an end-to-end result.
+
+The RustLogger Kafka binary currently emits NDJSON to stdout. There is no live Elasticsearch bulk sender in this repository, so the benchmark uses the stdout/file path.
 
 ### Benchmark Architecture
 
@@ -45,8 +46,8 @@ Built from scratch by a single developer. Benchmarked at **1.04 million events/s
                                               │  └────────┬─────────┘ │
                                               │           │           │
                                               │  ┌────────▼─────────┐ │
-                                              │  │ NVMe SSD / ES    │ │
-                                              │  │ Bulk Sink        │ │
+                                              │  │ JSON output      │ │
+                                              │  │ File / stdout    │ │
                                               │  └──────────────────┘ │
                                               └───────────────────────┘
 ```
@@ -89,7 +90,7 @@ Kafka poll() → raw bytes memcpy into RawBatch (no UTF-8 validation)
               └─ serde_json serialization (parallel, per-worker buffer)
                     │
                     ▼
-            Concatenate NDJSON fragments → Sink (ES bulk / file / stdout)
+            Concatenate NDJSON fragments → Sink (file / stdout)
 ```
 
 ### Key Design Decisions

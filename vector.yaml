@@ -1,4 +1,4 @@
-data_dir: /var/lib/vector
+data_dir: /tmp/rustlogger_bench/vector_data
 
 api:
   enabled: true
@@ -8,7 +8,7 @@ sources:
   kafka_logs:
     type: kafka
     bootstrap_servers: "localhost:9092"
-    group_id: "vector-bench"
+    group_id: "vector-bench-fair"
     topics:
       - raw-logs
     auto_offset_reset: "earliest"
@@ -21,31 +21,53 @@ transforms:
     inputs:
       - kafka_logs
     source: |
-      # ---- keep the raw line ----
-      .event.original = to_string(.message)""
-      .ecs.version = "8.11.0"
-      .event.dataset = "linux.auth"
-      .event.module = "system"
+      # Fair baseline for the RustLogger benchmark:
+      # one header parse, then one cheap string check and at most one
+      # classification regex per event. The previous version ran all
+      # 15 message regexes on every event.
 
-      # ---- split "TIMESTAMP HOST PROC[PID]: MSG" ----
-      base, base_err = parse_regex(.event.original, r'^(?P<ts>\S+)\s+(?P<host>\S+)\s+(?P<proc>\([^)]*\)|[A-Za-z0-9_\.\-]+)(\[(?P<pid>\d+)\])?:\s?(?P<msg>.*)$')
+      raw = to_string(.message) ?? ""
+      del(.headers)
+      del(.message_key)
+      del(.key)
+      del(.offset)
+      del(.partition)
+      del(.source_type)
+      del(.timestamp)
+      del(.topic)
+      .event.original = raw
+      .@version = "1"
+      .log_type = "auth"
+      .tags = ["vector", "kafka-pipeline"]
+      .event.dataset = "auth"
+      .event.kind = "event"
+      ._parse_stage = "raw"
+      .matched = false
 
-      msg = to_string(.event.original) ?? ""
+      hdr, hdr_err = parse_regex(raw, r'^(?P<ts>\S+)\s+(?P<host>\S+)\s+(?P<proc>\([^)]*\)|[A-Za-z0-9_\.\-]+)(?:\[(?P<pid>\d+)\])?:\s?(?P<msg>.*)$')
 
-      if base_err == null {
-        ts_str = to_string(base.ts)
-        host_str = to_string(base.host)
-        proc_str = to_string(base.proc)
-        pid_str = to_string(base.pid)
-        msg_str = to_string(base.msg)
+      msg = raw
+      proc = ""
 
-        parsed_ts, terr = parse_timestamp(ts_str, format: "%+")
-        if terr == null {
+      if hdr_err == null {
+        ts_str = to_string(hdr.ts)
+        host_str = to_string(hdr.host)
+        proc_str = to_string(hdr.proc)
+        pid_str = to_string(hdr.pid)
+        msg_str = to_string(hdr.msg)
+
+        parsed_ts, ts_err = parse_timestamp(ts_str, format: "%+")
+        if ts_err == null {
           .@timestamp = parsed_ts
+        } else {
+          .@timestamp = now()
+          .tags = push(.tags, "timestamp-parse-error")
         }
 
         .host.name = host_str
-        .process.name = strip_whitespace(replace(proc_str, r'[\(\)]', ""))
+        .host.hostname = host_str
+        proc = strip_whitespace(replace(proc_str, r'[\(\)]', ""))
+        .process.name = proc
 
         if pid_str != "" {
           pid_int, pid_err = to_int(pid_str)
@@ -54,237 +76,124 @@ transforms:
           }
         }
 
-        .message = msg_str
         msg = msg_str
-      } else {
         .message = msg
+      } else {
+        .@timestamp = now()
+        .message = raw
       }
 
-      # ---- default classification ----
-      .event.kind = "event"
-      .event.category = ["process"]
-      .event.type = ["info"]
-      .event.outcome = "unknown"
+      # ---- One classification branch per event, not 15 regexes ----
 
-      # ---- SSH: accepted password ----
-      m, e = parse_regex(msg, r'^Accepted password for (?P<user>\S+) from (?P<ip>\S+) port (?P<port>\d+)')
-      if e == null {
-        user_str = to_string(m.user)
-        ip_str = to_string(m.ip)
-        port_str = to_string(m.port)
-
+      if contains(msg, "Accepted password for") || contains(msg, "Accepted publickey for") {
+        .event.type_id = "auth_ssh_success"
+        .matched = true
+        ._parse_stage = "specialized"
         .event.category = ["authentication"]
         .event.type = ["start"]
-        .event.action = "ssh_login"
+        .event.action = "login"
         .event.outcome = "success"
-        .user.name = user_str
-        .source.ip = ip_str
-        port_int, pe = to_int(port_str)
-        if pe == null { .source.port = port_int }
-      }
-
-      # ---- SSH: failed password (valid or invalid user) ----
-      m, e = parse_regex(msg, r'^Failed password for (invalid user )?(?P<user>\S+) from (?P<ip>\S+) port (?P<port>\d+)')
-      if e == null {
-        user_str = to_string(m.user)
-        ip_str = to_string(m.ip)
-        port_str = to_string(m.port)
-
+        m, e = parse_regex(msg, r'^Accepted (?:password|publickey) for (?P<user>\S+) from (?P<ip>\S+) port (?P<port>\d+)')
+        if e == null {
+          .user.name = to_string(m.user)
+          .source.ip = to_string(m.ip)
+          port_int, port_err = to_int(to_string(m.port))
+          if port_err == null { .source.port = port_int }
+        }
+      } else if contains(msg, "Failed password for") || contains(msg, "Failed publickey for") {
+        .event.type_id = "auth_ssh_failed"
+        .matched = true
+        ._parse_stage = "specialized"
         .event.category = ["authentication"]
         .event.type = ["start"]
-        .event.action = "ssh_login"
+        .event.action = "login"
         .event.outcome = "failure"
-        .user.name = user_str
-        .source.ip = ip_str
-        port_int, pe = to_int(port_str)
-        if pe == null { .source.port = port_int }
-      }
-
-      # ---- SSH: generic PAM authentication failure ----
-      m, e = parse_regex(msg, r'authentication failure;.*rhost=(?P<ip>\S+)\s*(\s+user=(?P<user>\S+))?')
-      if e == null {
-        ip_str = to_string(m.ip)
-        user_str = to_string(m.user)
-
+        m, e = parse_regex(msg, r'^Failed (?:password|publickey) for (?:invalid user )?(?P<user>\S+) from (?P<ip>\S+) port (?P<port>\d+)')
+        if e == null {
+          .user.name = to_string(m.user)
+          .source.ip = to_string(m.ip)
+          port_int, port_err = to_int(to_string(m.port))
+          if port_err == null { .source.port = port_int }
+        }
+      } else if contains(msg, "Connection closed by") {
+        .event.type_id = "auth_ssh_connection_closed_invalid"
+        .matched = true
+        ._parse_stage = "specialized"
+        .event.category = ["authentication"]
+        .event.action = "connection_closed"
+        .event.outcome = "failure"
+        m, e = parse_regex(msg, r'^Connection closed by (?:invalid user |authenticating user )?(?P<user>\S+) (?P<ip>\S+) port (?P<port>\d+)')
+        if e == null {
+          .user.name = to_string(m.user)
+          .source.ip = to_string(m.ip)
+          port_int, port_err = to_int(to_string(m.port))
+          if port_err == null { .source.port = port_int }
+        }
+      } else if contains(msg, "Received disconnect from") {
+        .event.type_id = "auth_ssh_disconnect"
+        .matched = true
+        ._parse_stage = "specialized"
+        .event.category = ["authentication"]
+        .event.action = "disconnect"
+        .event.outcome = "success"
+        m, e = parse_regex(msg, r'^Received disconnect from (?P<ip>\S+) port (?P<port>\d+)')
+        if e == null {
+          .source.ip = to_string(m.ip)
+          port_int, port_err = to_int(to_string(m.port))
+          if port_err == null { .source.port = port_int }
+        }
+      } else if contains(msg, "Disconnected from user") {
+        .event.type_id = "auth_ssh_disconnected"
+        .matched = true
+        ._parse_stage = "specialized"
+        .event.category = ["authentication"]
+        .event.action = "disconnected"
+        .event.outcome = "success"
+        m, e = parse_regex(msg, r'^Disconnected from user (?P<user>\S+) (?P<ip>\S+) port (?P<port>\d+)')
+        if e == null {
+          .user.name = to_string(m.user)
+          .source.ip = to_string(m.ip)
+          port_int, port_err = to_int(to_string(m.port))
+          if port_err == null { .source.port = port_int }
+        }
+      } else if contains(msg, "Invalid user") {
+        .event.type_id = "auth_ssh_invalid_user"
+        .matched = true
+        ._parse_stage = "specialized"
         .event.category = ["authentication"]
         .event.type = ["start"]
-        .event.action = "ssh_login"
+        .event.action = "login"
         .event.outcome = "failure"
-        .source.ip = ip_str
-        if user_str != "" { .user.name = user_str }
-      }
-
-      # ---- SSH: invalid user attempt ----
-      m, e = parse_regex(msg, r'^Invalid user (?P<user>\S+) from (?P<ip>\S+) port (?P<port>\d+)')
-      if e == null {
-        user_str = to_string(m.user)
-        ip_str = to_string(m.ip)
-        port_str = to_string(m.port)
-
+        .event.reason = "invalid_user"
+        m, e = parse_regex(msg, r'^Invalid user (?P<user>\S+) from (?P<ip>\S+) port (?P<port>\d+)')
+        if e == null {
+          .user.name = to_string(m.user)
+          .source.ip = to_string(m.ip)
+          port_int, port_err = to_int(to_string(m.port))
+          if port_err == null { .source.port = port_int }
+        }
+      } else if contains(msg, "authentication failure") {
+        .event.type_id = "auth_ssh_auth_failure"
+        .matched = true
+        ._parse_stage = "specialized"
         .event.category = ["authentication"]
         .event.type = ["start"]
-        .event.action = "ssh_invalid_user"
+        .event.action = "login"
         .event.outcome = "failure"
-        .user.name = user_str
-        .source.ip = ip_str
-        port_int, pe = to_int(port_str)
-        if pe == null { .source.port = port_int }
-      }
-
-      # ---- SSH: connection closed (preauth) ----
-      m, e = parse_regex(msg, r'^Connection closed by (invalid user |authenticating user )?(?P<user>\S+) (?P<ip>\S+) port (?P<port>\d+)')
-      if e == null {
-        user_str = to_string(m.user)
-        ip_str = to_string(m.ip)
-        port_str = to_string(m.port)
-
-        .event.category = ["authentication"]
-        .event.type = ["end"]
-        .event.action = "ssh_connection_closed"
-        .event.outcome = "failure"
-        .user.name = user_str
-        .source.ip = ip_str
-        port_int, pe = to_int(port_str)
-        if pe == null { .source.port = port_int }
-      }
-
-      # ---- SSH: disconnect received ----
-      m, e = parse_regex(msg, r'^Received disconnect from (?P<ip>\S+) port (?P<port>\d+)')
-      if e == null {
-        ip_str = to_string(m.ip)
-        port_str = to_string(m.port)
-
-        .event.category = ["authentication"]
-        .event.type = ["end"]
-        .event.action = "ssh_disconnect_received"
-        .event.outcome = "success"
-        .source.ip = ip_str
-        port_int, pe = to_int(port_str)
-        if pe == null { .source.port = port_int }
-      }
-
-      # ---- SSH: disconnected ----
-      m, e = parse_regex(msg, r'^Disconnected from user (?P<user>\S+) (?P<ip>\S+) port (?P<port>\d+)')
-      if e == null {
-        user_str = to_string(m.user)
-        ip_str = to_string(m.ip)
-        port_str = to_string(m.port)
-
-        .event.category = ["authentication"]
-        .event.type = ["end"]
-        .event.action = "ssh_disconnected"
-        .event.outcome = "success"
-        .user.name = user_str
-        .source.ip = ip_str
-        port_int, pe = to_int(port_str)
-        if pe == null { .source.port = port_int }
-      }
-
-      # ---- PAM: session opened ----
-      m, e = parse_regex(msg, r'session opened for user (?P<user>[^\(]+)\(uid=\d+\) by (?P<by_user>[^\(]+)\(uid=\d+\)')
-      if e == null {
-        user_str = strip_whitespace(to_string(m.user))
-        by_user_str = strip_whitespace(to_string(m.by_user))
-
-        .event.category = ["session", "authentication"]
-        .event.type = ["start"]
-        .event.action = "session_opened"
-        .event.outcome = "success"
-        .user.name = user_str
-        .related.user = [user_str, by_user_str]
-      }
-
-      # ---- PAM: session closed ----
-      m, e = parse_regex(msg, r'session closed for user (?P<user>\S+)')
-      if e == null {
-        user_str = to_string(m.user)
-
-        .event.category = ["session", "authentication"]
-        .event.type = ["end"]
-        .event.action = "session_closed"
-        .event.outcome = "success"
-        .user.name = user_str
-      }
-
-      # ---- systemd-logind: new session ----
-      m, e = parse_regex(msg, r'^New session \d+ of user (?P<user>\S+)\.')
-      if e == null {
-        user_str = to_string(m.user)
-
+        .event.reason = "pam_auth_failure"
+        m, e = parse_regex(msg, r'authentication failure;.*rhost=(?P<ip>\S+)(?:\s+user=(?P<user>\S+))?')
+        if e == null {
+          .source.ip = to_string(m.ip)
+          if m.user != null {
+            user_str = to_string(m.user)
+            if user_str != "" { .user.name = user_str }
+          }
+        }
+      } else if starts_with(proc, "CRON") {
+        .event.type_id = "auth_cron_session"
+        .matched = true
+        ._parse_stage = "specialized"
         .event.category = ["session"]
-        .event.type = ["start"]
-        .event.action = "logind_new_session"
-        .event.outcome = "success"
-        .user.name = user_str
-      }
-
-      # ---- systemd-logind: session logged out / removed ----
-      m, e = parse_regex(msg, r'^Session \d+ logged out')
-      if e == null {
-        .event.category = ["session"]
-        .event.type = ["end"]
-        .event.action = "logind_session_logged_out"
-        .event.outcome = "success"
-      }
-
-      m, e = parse_regex(msg, r'^Removed session \d+')
-      if e == null {
-        .event.category = ["session"]
-        .event.type = ["end"]
-        .event.action = "logind_session_removed"
-        .event.outcome = "success"
-      }
-
-      # ---- sudo: command execution ----
-      m, e = parse_regex(msg, r'^(?P<user>\S+)\s*:\s*TTY=(?P<tty>\S+)\s*;\s*PWD=(?P<pwd>\S+)\s*;\s*USER=(?P<target_user>\S+)\s*;\s*COMMAND=(?P<command>.*)$')
-      if e == null {
-        user_str = to_string(m.user)
-        target_str = to_string(m.target_user)
-        pwd_str = to_string(m.pwd)
-        cmd_str = to_string(m.command)
-
-        .event.category = ["process", "authentication"]
-        .event.type = ["start"]
-        .event.action = "sudo_command"
-        .event.outcome = "success"
-        .user.name = user_str
-        .user.target.name = target_str
-        .process.working_directory = pwd_str
-        .process.command_line = cmd_str
-      }
-
-      # ---- sudo: pam session opened for root ----
-      m, e = parse_regex(msg, r'^pam_unix\(sudo:session\): session opened for user (?P<target_user>[^\(]+)\(uid=\d+\) by (?P<user>[^\(]+)\(uid=\d+\)')
-      if e == null {
-        user_str = strip_whitespace(to_string(m.user))
-        target_str = strip_whitespace(to_string(m.target_user))
-
-        .event.category = ["session", "authentication"]
-        .event.type = ["start"]
-        .event.action = "sudo_session_opened"
-        .event.outcome = "success"
-        .user.name = user_str
-        .user.target.name = target_str
-      }
-
-      # ---- su: switch user ----
-      m, e = parse_regex(msg, r'^\(to (?P<target_user>\S+)\) (?P<user>\S+) on (?P<tty>\S+)')
-      if e == null {
-        user_str = to_string(m.user)
-        target_str = to_string(m.target_user)
-
-        .event.category = ["process", "authentication"]
-        .event.type = ["change"]
-        .event.action = "su"
-        .event.outcome = "success"
-        .user.name = user_str
-        .user.target.name = target_str
-      }
-
-      # ---- cron ----
-      proc_name = to_string(.process.name) ?? ""
-      if starts_with(proc_name, "CRON") {
-        .event.category = ["process"]
         .event.dataset = "linux.cron"
         if contains(msg, "session opened") {
           .event.type = ["start"]
@@ -292,18 +201,117 @@ transforms:
         } else if contains(msg, "session closed") {
           .event.type = ["end"]
           .event.action = "cron_session_closed"
+        } else {
+          .event.action = "cron"
         }
         .event.outcome = "success"
-      }
-
-      # ---- final cleanup ----
-      action = to_string(.event.action) ?? ""
-      if action == "" {
+      } else if contains(msg, "pam_unix(sshd:session): session opened") {
+        .event.type_id = "auth_ssh_session_opened"
+        .matched = true
+        ._parse_stage = "specialized"
+        .event.category = ["session"]
+        .event.type = ["start"]
+        .event.action = "ssh_session_opened"
+        m, e = parse_regex(msg, r'session opened for user (?P<user>[^\(]+)\(uid=\d+\) by (?P<by_user>[^\(]+)\(uid=\d+\)')
+        if e == null {
+          .user.name = strip_whitespace(to_string(m.user))
+          .related.user = [strip_whitespace(to_string(m.user)), strip_whitespace(to_string(m.by_user))]
+        }
+      } else if contains(msg, "pam_unix(sshd:session): session closed") {
+        .event.type_id = "auth_ssh_session_closed"
+        .matched = true
+        ._parse_stage = "specialized"
+        .event.category = ["session"]
+        .event.type = ["end"]
+        .event.action = "ssh_session_closed"
+        m, e = parse_regex(msg, r'session closed for user (?P<user>\S+)')
+        if e == null { .user.name = to_string(m.user) }
+      } else if contains(msg, "pam_unix(sudo:session): session opened") {
+        .event.type_id = "auth_sudo_session_opened"
+        .matched = true
+        ._parse_stage = "specialized"
+        .event.category = ["session"]
+        .event.type = ["start"]
+        .event.action = "sudo_session_opened"
+        m, e = parse_regex(msg, r'session opened for user (?P<target_user>[^\(]+)\(uid=\d+\) by (?P<user>[^\(]+)\(uid=\d+\)')
+        if e == null {
+          .user.name = strip_whitespace(to_string(m.user))
+          .user.target.name = strip_whitespace(to_string(m.target_user))
+        }
+      } else if contains(msg, "TTY=") {
+        .event.type_id = "auth_sudo_command"
+        .matched = true
+        ._parse_stage = "specialized"
+        .event.category = ["process"]
+        .event.action = "sudo_command"
+        .event.outcome = "success"
+        m, e = parse_regex(msg, r'^(?P<user>\S+)\s*:\s*TTY=(?P<tty>\S+)\s*;\s*PWD=(?P<pwd>\S+)\s*;\s*USER=(?P<target_user>\S+)\s*;\s*COMMAND=(?P<command>.*)$')
+        if e == null {
+          .user.name = to_string(m.user)
+          .tty = to_string(m.tty)
+          .process.working_directory = to_string(m.pwd)
+          .user.target.name = to_string(m.target_user)
+          .process.command_line = to_string(m.command)
+        }
+      } else if contains(msg, "(to ") {
+        .event.type_id = "auth_su_switch"
+        .matched = true
+        ._parse_stage = "specialized"
+        .event.category = ["authentication"]
+        .event.action = "su_switch"
+        m, e = parse_regex(msg, r'^\(to (?P<target_user>\S+)\) (?P<user>\S+) on (?P<tty>\S+)')
+        if e == null {
+          .user.target.name = to_string(m.target_user)
+          .user.name = to_string(m.user)
+          .tty = to_string(m.tty)
+        }
+      } else if contains(msg, "New session") {
+        .event.type_id = "auth_logind_new_session"
+        .matched = true
+        ._parse_stage = "specialized"
+        .event.category = ["session"]
+        .event.type = ["start"]
+        .event.action = "logind_new_session"
+        m, e = parse_regex(msg, r'^New session (?P<session>\S+) of user (?P<user>\S+)\.')
+        if e == null {
+          .session.id = to_string(m.session)
+          .user.name = to_string(m.user)
+        }
+      } else if contains(msg, "logged out") {
+        .event.type_id = "auth_logind_session_logout"
+        .matched = true
+        ._parse_stage = "specialized"
+        .event.category = ["session"]
+        .event.type = ["end"]
+        .event.action = "logind_session_logout"
+      } else if contains(msg, "Removed session") {
+        .event.type_id = "auth_logind_removed_session"
+        .matched = true
+        ._parse_stage = "specialized"
+        .event.category = ["session"]
+        .event.action = "logind_removed_session"
+        m, e = parse_regex(msg, r'^Removed session (?P<session>\S+)\.')
+        if e == null { .session.id = to_string(m.session) }
+      } else {
         .event.action = "unclassified"
+        .event.outcome = "unknown"
       }
 
 sinks:
-  blackhole:
+  out:
+    type: file
+    inputs:
+      - auth_to_ecs
+    path: /tmp/rustlogger_bench/vector_out.ndjson
+    encoding:
+      codec: json
+    idle_timeout_secs: 1
+    buffer:
+      type: memory
+      max_events: 5000
+      when_full: block
+
+  count:
     type: blackhole
     inputs:
       - auth_to_ecs
